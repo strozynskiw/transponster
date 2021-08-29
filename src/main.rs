@@ -20,22 +20,25 @@ pub struct TransactionInput {
 
 // Yes. I know... But I have tests for this!
 fn string_to_money(input: &str) -> i64 {
-    let parts:Vec<&str> = input.split('.').collect();
+    let parts: Vec<&str> = input.split('.').collect();
     let mut amount: i64 = (parts[0].parse::<i64>().unwrap_or_default() * 10000) as i64;
     if parts.len() == 2 {
-        amount += format!("{:0<4}",parts[1]).chars().take(4).collect::<String>().parse::<i64>().unwrap_or_default() as i64;
+        amount += format!("{:0<4}", parts[1])
+            .chars()
+            .take(4)
+            .collect::<String>()
+            .parse::<i64>()
+            .unwrap_or_default() as i64;
     }
     amount
 }
 
 fn money_to_string(input: &i64) -> String {
-
     let integral = input / 10000;
     let decimal = input - integral * 10000;
 
-    String::from(format!("{}.{:04}", integral, decimal))
+    format!("{}.{:04}", integral, decimal)
 }
-
 
 fn parse(path: &str) -> Result<Vec<Transaction>> {
     let mut output: Vec<engine::models::Transaction> = Vec::new();
@@ -55,12 +58,7 @@ fn parse(path: &str) -> Result<Vec<Transaction>> {
                 _ => OperationType::Unknown,
             },
             client: record.client,
-            amount: match record.amount {
-                Some(value) => {
-                    Some(string_to_money(&value))
-                }, //4 digit precision
-                None => None,
-            },
+            amount: record.amount.map(|value| string_to_money(&value)),
         });
     }
 
@@ -99,7 +97,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-
 #[test]
 fn test_money_to_string() {
     assert_eq!(money_to_string(&1), "0.0001");
@@ -116,7 +113,10 @@ fn test_money_to_string() {
     assert_eq!(money_to_string(&220000000000001), "22000000000.0001");
     assert_eq!(money_to_string(&2200000000000001), "220000000000.0001");
     assert_eq!(money_to_string(&22000000000000001), "2200000000000.0001");
-    assert_eq!(money_to_string(&2200000000000000001), "220000000000000.0001");
+    assert_eq!(
+        money_to_string(&2200000000000000001),
+        "220000000000000.0001"
+    );
 }
 
 #[test]

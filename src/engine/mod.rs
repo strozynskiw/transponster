@@ -64,7 +64,7 @@ fn operation_dispute(
         .iter()
         .find(|x| x.transaction_id == details.transaction_id);
 
-    if  let Some(t) = referenced_transaction {
+    if let Some(t) = referenced_transaction {
         match t.amount {
             Some(amount)
                 if details.client == t.client
@@ -98,7 +98,7 @@ fn operation_resolve(
         .iter()
         .find(|x| x.transaction_id == details.transaction_id);
 
-    if  let Some(t) = referenced_transaction {
+    if let Some(t) = referenced_transaction {
         match t.amount {
             Some(amount)
                 if details.client == t.client
@@ -137,7 +137,7 @@ fn operation_chargeback(
         .iter()
         .find(|x| x.transaction_id == details.transaction_id);
 
-    if  let Some(t) = referenced_transaction {
+    if let Some(t) = referenced_transaction {
         match t.amount {
             Some(amount)
                 if details.client == t.client
