@@ -66,11 +66,11 @@ fn parse(path: &str) -> Result<Vec<Transaction>> {
 }
 
 fn print_map(result: &engine::AccountsMap) -> Result<()> {
-    println!("client,available,held,total,locked");
+    print!("client,available,held,total,locked");
 
     result.iter().for_each(|(c, d)| {
-        println!(
-            "{},{},{},{},{}",
+        print!(
+            "\n{},{},{},{},{}",
             c,
             money_to_string(&d.available),
             money_to_string(&d.held),
