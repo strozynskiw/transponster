@@ -51,7 +51,9 @@ fn operation_deposit(details: &Transaction, account: &mut AccountData) {
 
 fn operation_withdraw(details: &Transaction, account: &mut AccountData) {
     if let Some(v) = details.amount {
-        account.available -= v;
+        if account.available >= v {
+            account.available -= v;
+        }
     } // Ignored as there is nothing to do
 }
 
@@ -225,7 +227,7 @@ mod tests {
 
         assert_eq!(
             &AccountData {
-                available: -20000,
+                available: 0,
                 held: 0,
                 locked: false,
                 disputes: vec![]
@@ -285,7 +287,7 @@ mod tests {
 
         assert_eq!(
             &AccountData {
-                available: -5000,
+                available: 10000,
                 held: 0,
                 locked: false,
                 disputes: vec![]
