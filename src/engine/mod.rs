@@ -1,273 +1,385 @@
 use anyhow::Result;
-use csv::{ReaderBuilder, Trim};
-use rust_decimal_macros::dec;
-use std::{collections::HashMap, fs::File, path::Path};
+use csv::{Reader, ReaderBuilder, Trim, Writer};
+use rust_decimal::Decimal;
+
+use std::path::PathBuf;
+
+pub mod error;
+use error::{EngineError, ProcessingError};
 
 pub mod models;
-use models::{AccountData, OperationType, Transaction};
-
-use thiserror::Error;
-
-pub type AccountsMap = HashMap<u16, AccountData>;
-pub type Transactions = Vec<Transaction>;
+use models::{AccountData, AccountsMap, OperationType, ReportRow, Transaction};
 
 pub struct Engine {
     accounts: AccountsMap,
-
-    // That should be just a database access so i don't care about the vector
-    // inefficiency in that role
-    transactions: Transactions,
-}
-
-#[derive(Error, Debug)]
-pub enum ProcessorError {
-    #[error("Parsing error")]
-    Parsing(#[from] csv::Error),
-    #[error("IO read error")]
-    Reading(#[from] std::io::Error),
-    //#[error("Engine operation error: `{0}`")]
-    //Operation(String),
 }
 
 impl Engine {
-    pub fn new() -> Engine {
+    pub fn new() -> Self {
         Self {
             accounts: AccountsMap::new(),
-            transactions: Transactions::new(),
         }
     }
 
-    pub fn process_input(&mut self, path: &Path) -> Result<(), ProcessorError> {
-        let file = File::open(path)?;
-        let mut rdr = ReaderBuilder::new().trim(Trim::All).from_reader(file);
-        for line in rdr.deserialize() {
+    // This public method takes file to load.
+    pub fn process_input(&mut self, path: &PathBuf) -> Result<(), EngineError> {
+        let rdr = ReaderBuilder::new()
+            .flexible(true)
+            .trim(Trim::All)
+            .from_path(path)?;
+        self.process_from_reader(rdr)
+    }
+
+    // This is extracted mostly for parsing test purposes but could also be used with other sources that just a file
+    pub fn process_from_reader<T: std::io::Read>(
+        &mut self,
+        mut reader: Reader<T>,
+    ) -> Result<(), EngineError> {
+        for line in reader.deserialize() {
             let transaction: Transaction = line?;
-            self.process_one(transaction)?;
+
+            // That's how return processing error wrapped with EngineError
+            // This however stops the execution.
+            // self.process_one(transaction)?;
+
+            if let Err(e) = self.process_one(transaction) {
+                eprintln!("Processing error: {e}");
+            }
         }
 
         Ok(())
     }
 
-    pub fn print_report(&self) {
-        // Some buf writer here would be great, but let's keep it simple.
-        println!("client,available,held,total,locked");
-        self.accounts.iter().for_each(|(c, d)| {
-            println!(
-                "{},{:.04},{:.04},{:.04},{}",
-                c,
-                d.available,
-                d.held,
-                d.available + d.held,
-                d.locked
-            )
-        });
+    pub fn serialize_report_to_writer<T: std::io::Write>(
+        &self,
+        mut writer: Writer<T>,
+    ) -> Result<(), EngineError> {
+        self.accounts
+            .iter()
+            .map(|(client_id, data)| ReportRow {
+                client_id: *client_id,
+                available: data.available,
+                held: data.held,
+                total: data.available + data.held,
+                locked: data.locked,
+            })
+            .try_for_each(|row| writer.serialize(row))?;
+
+        writer.flush()?;
+
+        Ok(())
     }
 
-    fn get_account(&mut self, client_id: u16) -> &mut AccountData {
-        self.accounts.entry(client_id).or_insert(AccountData {
-            available: dec!(0),
-            held: dec!(0),
-            locked: false,
-            disputes: Vec::new(),
-        })
+    pub fn serialize_report_stdout(&mut self) -> Result<(), EngineError> {
+        let writer = csv::Writer::from_writer(std::io::stdout());
+        self.serialize_report_to_writer(writer)
     }
+    fn process_one(&mut self, transaction: Transaction) -> Result<(), ProcessingError> {
+        let account = self.accounts.entry(transaction.client_id).or_default();
 
-    fn process_one(&mut self, transaction: Transaction) -> Result<(), ProcessorError> {
+        if account.locked {
+            return Err(ProcessingError::AccountLocked(transaction.client_id));
+        };
+
         match transaction.operation {
-            OperationType::Deposit => self.operation_deposit(&transaction)?,
-            OperationType::Withdrawal => self.operation_withdraw(&transaction)?,
-            OperationType::Dispute => self.operation_dispute(&transaction)?,
-            OperationType::Resolve => self.operation_resolve(&transaction)?,
-            OperationType::Chargeback => self.operation_chargeback(&transaction)?,
+            OperationType::Deposit => operation_deposit(account, transaction)?,
+            OperationType::Withdrawal => operation_withdraw(account, transaction)?,
+            OperationType::Dispute => operation_dispute(account, transaction)?,
+            OperationType::Resolve => operation_resolve(account, transaction)?,
+            OperationType::Chargeback => operation_chargeback(account, transaction)?,
         }
-        self.transactions.push(transaction);
-        Ok(())
-    }
-
-    fn operation_deposit(&mut self, details: &Transaction) -> Result<(), ProcessorError> {
-        let account = self.get_account(details.client);
-
-        if account.locked {
-            return Ok(());
-        }
-
-        if let Some(v) = details.amount {
-            account.available += v;
-        } // Ignored as there is nothing to do
 
         Ok(())
     }
+}
 
-    fn operation_withdraw(&mut self, details: &Transaction) -> Result<(), ProcessorError> {
-        let account = self.get_account(details.client);
-
-        if account.locked {
-            return Ok(());
-        }
-
-        if let Some(v) = details.amount {
-            if account.available >= v {
-                account.available -= v;
-            } // I don't want to fail the whole operation processing here, so it is ignored.
-        } // Ignored as there is nothing to do
-
-        Ok(())
+fn operation_deposit(
+    account: &mut AccountData,
+    transaction: Transaction,
+) -> Result<(), ProcessingError> {
+    // Deduplication
+    if account.transactions.contains_key(&transaction.id) {
+        return Err(ProcessingError::DuplicatedTransaction(
+            transaction.id,
+            transaction.client_id,
+        ));
     }
 
-    fn operation_dispute(&mut self, details: &Transaction) -> Result<(), ProcessorError> {
-        let referenced_transaction = self
-            .transactions
-            .iter()
-            .find(|x| x.transaction_id == details.transaction_id)
-            .cloned();
+    let amount = transaction
+        .amount
+        .ok_or(ProcessingError::MissingAmount(transaction.id))?;
 
-        let account = self.get_account(details.client);
-
-        if account.locked {
-            return Ok(());
-        }
-
-        if let Some(t) = referenced_transaction {
-            match t.amount {
-                Some(amount)
-                    if details.client == t.client
-                        && !account.disputes.contains(&details.transaction_id) =>
-                {
-                    match t.operation {
-                        OperationType::Deposit => {
-                            account.available -= amount;
-                            account.held += amount;
-                        }
-                        OperationType::Withdrawal => {
-                            account.held += amount;
-                        }
-                        _ => {} // Should not happen
-                    }
-
-                    account.disputes.push(details.transaction_id);
-                }
-                Some(_) => {} // Client doesn't match or dispute already exists
-                None => {}    // No amount
-            }
-        } // No referenced transaction
-
-        Ok(())
+    if amount < Decimal::ZERO {
+        return Err(ProcessingError::NegativeAmount);
     }
 
-    fn operation_resolve(&mut self, details: &Transaction) -> Result<(), ProcessorError> {
-        let referenced_transaction = self
-            .transactions
-            .iter()
-            .find(|x| x.transaction_id == details.transaction_id)
-            .cloned();
+    account.available = account
+        .available
+        .checked_add(amount)
+        .ok_or(ProcessingError::Overflow(transaction.id))?;
 
-        let account = self.get_account(details.client);
+    account.transactions.insert(transaction.id, transaction);
 
-        if account.locked {
-            return Ok(());
-        }
+    Ok(())
+}
 
-        if let Some(t) = referenced_transaction {
-            match t.amount {
-                Some(amount)
-                    if details.client == t.client
-                        && account.disputes.contains(&details.transaction_id) =>
-                {
-                    match t.operation {
-                        OperationType::Deposit => {
-                            account.available += amount;
-                            account.held -= amount;
-                        }
-                        OperationType::Withdrawal => {
-                            account.held -= amount;
-                        }
-                        _ => {} // Invalid input ignored
-                    }
-
-                    if let Some(index) = account
-                        .disputes
-                        .iter()
-                        .position(|x| *x == details.transaction_id)
-                    {
-                        account.disputes.remove(index);
-                    } // Else ignored - third party issue
-                }
-                Some(_) => {} // client doesn't match or dispute doesn't exist
-                None => {}    // No amount
-            }
-        } // No referenced transaction - third party error
-        Ok(())
+fn operation_withdraw(
+    account: &mut AccountData,
+    transaction: Transaction,
+) -> Result<(), ProcessingError> {
+    // Deduplication
+    if account.transactions.contains_key(&transaction.id) {
+        return Err(ProcessingError::DuplicatedTransaction(
+            transaction.id,
+            transaction.client_id,
+        ));
     }
 
-    fn operation_chargeback(&mut self, details: &Transaction) -> Result<(), ProcessorError> {
-        let referenced_transaction = self
-            .transactions
-            .iter()
-            .find(|x| x.transaction_id == details.transaction_id)
-            .cloned();
+    let amount = transaction
+        .amount
+        .ok_or(ProcessingError::MissingAmount(transaction.id))?;
 
-        let account = self.get_account(details.client);
-
-        if account.locked {
-            return Ok(());
-        }
-
-        if let Some(t) = referenced_transaction {
-            match t.amount {
-                Some(amount)
-                    if details.client == t.client
-                        && account.disputes.contains(&details.transaction_id) =>
-                {
-                    match t.operation {
-                        OperationType::Deposit => {
-                            account.held -= amount;
-                        }
-                        OperationType::Withdrawal => {
-                            account.available += amount;
-                            account.held -= amount;
-                        }
-                        _ => {} // Should not happen
-                    }
-
-                    let index = account
-                        .disputes
-                        .iter()
-                        .position(|x| *x == details.transaction_id)
-                        .unwrap();
-                    account.disputes.remove(index);
-                    account.locked = true;
-                }
-                Some(_) => {} // Client doesn't match or dispute doesn't exist
-                None => {}    // No amount
-            }
-        } // No referenced transaction
-        Ok(())
+    if amount < Decimal::ZERO {
+        return Err(ProcessingError::NegativeAmount);
     }
+
+    if account.available < amount {
+        return Err(ProcessingError::InsufficientFounds(
+            transaction.id,
+            transaction.client_id,
+        ));
+    }
+
+    account.available = account
+        .available
+        .checked_sub(amount)
+        .ok_or(ProcessingError::Underflow(transaction.id))?;
+
+    account.transactions.insert(transaction.id, transaction);
+
+    Ok(())
+}
+
+fn operation_dispute(
+    account: &mut AccountData,
+    transaction: Transaction,
+) -> Result<(), ProcessingError> {
+    let referenced_transaction = account.transactions.get(&transaction.id);
+
+    let disputed_transaction =
+        referenced_transaction.ok_or(ProcessingError::MissingTransaction(transaction.id))?;
+
+    // Check duplicated dispute for a transaction
+    if account.under_dispute.contains(&disputed_transaction.id) {
+        return Err(ProcessingError::DuplicatedDispute(
+            transaction.id,
+            disputed_transaction.id,
+            transaction.client_id,
+        ));
+    }
+
+    let disputed_amount = disputed_transaction
+        .amount
+        .ok_or(ProcessingError::MissingAmount(transaction.id))?;
+
+    match disputed_transaction.operation {
+        OperationType::Deposit => {
+            // We need to do both checked operations to keep the transaction valid
+            let new_available = account
+                .available
+                .checked_sub(disputed_amount)
+                .ok_or(ProcessingError::Underflow(transaction.id))?;
+
+            let new_held = account
+                .held
+                .checked_add(disputed_amount)
+                .ok_or(ProcessingError::Overflow(transaction.id))?;
+
+            account.available = new_available;
+            account.held = new_held;
+        }
+        OperationType::Withdrawal => {
+            // The other way around. I guess it means withdrawn money was
+            // not received, so we put it back for now
+            account.held = account
+                .held
+                .checked_add(disputed_amount)
+                .ok_or(ProcessingError::Overflow(transaction.id))?;
+        }
+        _ => {
+            return Err(ProcessingError::InvalidOperationUnderDispute(
+                transaction.operation,
+                transaction.id,
+            ))
+        }
+    }
+
+    account.under_dispute.insert(disputed_transaction.id);
+
+    Ok(())
+}
+
+fn operation_resolve(
+    account: &mut AccountData,
+    transaction: Transaction,
+) -> Result<(), ProcessingError> {
+    let referenced_transaction = account.transactions.get(&transaction.id);
+
+    let disputed_transaction =
+        referenced_transaction.ok_or(ProcessingError::MissingTransaction(transaction.id))?;
+
+    // Check if transaction under dispute
+    if !account.under_dispute.contains(&disputed_transaction.id) {
+        return Err(ProcessingError::IncorrectResolve(
+            transaction.operation,
+            transaction.id,
+        ));
+    }
+
+    let disputed_amount = disputed_transaction
+        .amount
+        .ok_or(ProcessingError::MissingAmount(transaction.id))?;
+
+    match disputed_transaction.operation {
+        OperationType::Deposit | OperationType::Withdrawal => {
+            let new_available = account
+                .available
+                .checked_add(disputed_amount)
+                .ok_or(ProcessingError::Overflow(transaction.id))?;
+
+            let new_held = account
+                .held
+                .checked_sub(disputed_amount)
+                .ok_or(ProcessingError::Underflow(transaction.id))?;
+
+            account.available = new_available;
+            account.held = new_held;
+        }
+        _ => {
+            return Err(ProcessingError::InvalidOperationUnderDispute(
+                transaction.operation,
+                transaction.id,
+            ))
+        }
+    }
+
+    account.under_dispute.remove(&disputed_transaction.id);
+
+    Ok(())
+}
+
+fn operation_chargeback(
+    account: &mut AccountData,
+    transaction: Transaction,
+) -> Result<(), ProcessingError> {
+    let referenced_transaction = account.transactions.get(&transaction.id);
+
+    let disputed_transaction =
+        referenced_transaction.ok_or(ProcessingError::MissingTransaction(transaction.id))?;
+
+    // Check if transaction under dispute
+    if !account.under_dispute.contains(&disputed_transaction.id) {
+        return Err(ProcessingError::IncorrectChargeback(
+            transaction.operation,
+            transaction.id,
+        ));
+    }
+
+    let disputed_amount = disputed_transaction
+        .amount
+        .ok_or(ProcessingError::MissingAmount(transaction.id))?;
+
+    match disputed_transaction.operation {
+        OperationType::Deposit | OperationType::Withdrawal => {
+            account.held = account
+                .held
+                .checked_sub(disputed_amount)
+                .ok_or(ProcessingError::Underflow(transaction.id))?;
+        }
+        _ => {
+            return Err(ProcessingError::InvalidOperationUnderDispute(
+                transaction.operation,
+                transaction.id,
+            ))
+        }
+    }
+
+    account.under_dispute.remove(&disputed_transaction.id);
+
+    account.locked = true;
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use rust_decimal_macros::dec;
 
+    use crate::engine::error::ProcessingError;
     use crate::engine::models::AccountData;
     use crate::engine::models::OperationType;
 
     use super::Transaction;
-    use super::Transactions;
+
+    #[test]
+    fn error_duplicated_transaction() {
+        let mut engine = super::Engine::new();
+        engine
+            .process_one(Transaction {
+                id: 1,
+                operation: OperationType::Deposit,
+                client_id: 10,
+                amount: Some(dec!(1)),
+            })
+            .unwrap();
+
+        let result = engine.process_one(Transaction {
+            id: 1,
+            operation: OperationType::Withdrawal,
+            client_id: 10,
+            amount: Some(dec!(2)),
+        });
+
+        assert_eq!(result, Err(ProcessingError::DuplicatedTransaction(1, 10)));
+    }
+
+    #[test]
+    fn error_insufficient_founds() {
+        let mut engine = super::Engine::new();
+        engine
+            .process_one(Transaction {
+                id: 1,
+                operation: OperationType::Deposit,
+                client_id: 10,
+                amount: Some(dec!(1)),
+            })
+            .unwrap();
+
+        let result = engine.process_one(Transaction {
+            id: 2,
+            operation: OperationType::Withdrawal,
+            client_id: 10,
+            amount: Some(dec!(2)),
+        });
+
+        assert_eq!(result, Err(ProcessingError::InsufficientFounds(2, 10)));
+    }
 
     #[test]
     fn two_deposits() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
         ];
@@ -282,7 +394,7 @@ mod tests {
                 available: dec!(2),
                 held: dec!(0),
                 locked: false,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -290,17 +402,17 @@ mod tests {
 
     #[test]
     fn two_withdrawals() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
         ];
@@ -308,14 +420,14 @@ mod tests {
         let mut engine = super::Engine::new();
         transactions
             .into_iter()
-            .for_each(|t| engine.process_one(t).unwrap());
+            .for_each(|t| _ = engine.process_one(t));
 
         assert_eq!(
             &AccountData {
                 available: dec!(0),
                 held: dec!(0),
                 locked: false,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -323,17 +435,17 @@ mod tests {
 
     #[test]
     fn deposit_withdraw_balance_positive() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(0.5)),
             },
         ];
@@ -348,7 +460,7 @@ mod tests {
                 available: dec!(0.5),
                 held: dec!(0),
                 locked: false,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -356,17 +468,17 @@ mod tests {
 
     #[test]
     fn deposit_withdraw_balance_negative() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1.5)),
             },
         ];
@@ -374,14 +486,14 @@ mod tests {
         let mut engine = super::Engine::new();
         transactions
             .into_iter()
-            .for_each(|t| engine.process_one(t).unwrap());
+            .for_each(|t| _ = engine.process_one(t));
 
         assert_eq!(
             &AccountData {
                 available: dec!(1),
                 held: dec!(0),
                 locked: false,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -389,17 +501,17 @@ mod tests {
 
     #[test]
     fn deposit_and_dispute() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
         ];
@@ -407,14 +519,15 @@ mod tests {
         let mut engine = super::Engine::new();
         transactions
             .into_iter()
-            .for_each(|t| engine.process_one(t).unwrap());
+            .for_each(|t| _ = engine.process_one(t));
 
         assert_eq!(
             &AccountData {
                 available: dec!(0),
                 held: dec!(1),
                 locked: false,
-                disputes: vec![1]
+                under_dispute: HashSet::from_iter(vec![1]),
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -422,23 +535,23 @@ mod tests {
 
     #[test]
     fn deposit_withdrawal_and_dispute_deposit() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(3)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
         ];
@@ -446,14 +559,15 @@ mod tests {
         let mut engine = super::Engine::new();
         transactions
             .into_iter()
-            .for_each(|t| engine.process_one(t).unwrap());
+            .for_each(|t| _ = engine.process_one(t));
 
         assert_eq!(
             &AccountData {
                 available: dec!(-2),
                 held: dec!(3),
                 locked: false,
-                disputes: vec![1]
+                under_dispute: HashSet::from_iter(vec![1]),
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -461,23 +575,23 @@ mod tests {
 
     #[test]
     fn deposit_dispute_and_resolve_deposit() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Resolve,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
         ];
@@ -492,7 +606,7 @@ mod tests {
                 available: dec!(1),
                 held: dec!(0),
                 locked: false,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -500,23 +614,23 @@ mod tests {
 
     #[test]
     fn deposit_dispute_and_chargeback_deposit() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Chargeback,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
         ];
@@ -531,7 +645,7 @@ mod tests {
                 available: dec!(0),
                 held: dec!(0),
                 locked: true,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -539,23 +653,23 @@ mod tests {
 
     #[test]
     fn deposit_withdrawal_and_dispute_withdrawal() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
         ];
@@ -570,7 +684,8 @@ mod tests {
                 available: dec!(1),
                 held: dec!(1),
                 locked: false,
-                disputes: vec![2]
+                under_dispute: HashSet::from_iter(vec![2]),
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -578,29 +693,29 @@ mod tests {
 
     #[test]
     fn deposit_withdrawal_dispute_and_chargeback_withdrawal() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Chargeback,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
         ];
@@ -612,10 +727,10 @@ mod tests {
 
         assert_eq!(
             &AccountData {
-                available: dec!(2),
+                available: dec!(1),
                 held: dec!(0),
                 locked: true,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -623,29 +738,29 @@ mod tests {
 
     #[test]
     fn deposit_withdrawal_dispute_and_chargeback_deposit() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Chargeback,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
         ];
@@ -660,7 +775,7 @@ mod tests {
                 available: dec!(-1),
                 held: dec!(0),
                 locked: true,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -668,29 +783,29 @@ mod tests {
 
     #[test]
     fn deposit_withdrawal_dispute_and_resolve_deposit() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Resolve,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
         ];
@@ -705,7 +820,7 @@ mod tests {
                 available: dec!(1),
                 held: dec!(0),
                 locked: false,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -713,29 +828,29 @@ mod tests {
 
     #[test]
     fn deposit_withdrawal_dispute_and_resolve_withdrawal() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(1)),
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Resolve,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
         ];
@@ -747,10 +862,10 @@ mod tests {
 
         assert_eq!(
             &AccountData {
-                available: dec!(1),
+                available: dec!(2),
                 held: dec!(0),
                 locked: false,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -758,29 +873,29 @@ mod tests {
 
     #[test]
     fn no_deposit_on_locked_account() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Chargeback,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
         ];
@@ -788,14 +903,14 @@ mod tests {
         let mut engine = super::Engine::new();
         transactions
             .into_iter()
-            .for_each(|t| engine.process_one(t).unwrap());
+            .for_each(|t| _ = engine.process_one(t));
 
         assert_eq!(
             &AccountData {
                 available: dec!(0),
                 held: dec!(0),
                 locked: true,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
@@ -803,29 +918,29 @@ mod tests {
 
     #[test]
     fn no_withdrawal_on_locked_account() {
-        let transactions: Transactions = vec![
+        let transactions: Vec<Transaction> = vec![
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Deposit,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Dispute,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 1,
+                id: 1,
                 operation: OperationType::Chargeback,
-                client: 10,
+                client_id: 10,
                 amount: None,
             },
             Transaction {
-                transaction_id: 2,
+                id: 2,
                 operation: OperationType::Withdrawal,
-                client: 10,
+                client_id: 10,
                 amount: Some(dec!(2)),
             },
         ];
@@ -833,14 +948,14 @@ mod tests {
         let mut engine = super::Engine::new();
         transactions
             .into_iter()
-            .for_each(|t| engine.process_one(t).unwrap());
+            .for_each(|t| _ = engine.process_one(t));
 
         assert_eq!(
             &AccountData {
                 available: dec!(0),
                 held: dec!(0),
                 locked: true,
-                disputes: vec![]
+                ..Default::default()
             },
             engine.accounts.get(&10).unwrap()
         );
